@@ -1,0 +1,21 @@
+# Caddyfile — reverse proxy HTTPS automatique devant le serveur de synchro.
+# Caddy obtient ET renouvelle le certificat Let's Encrypt tout seul
+# (ports 80 et 443 doivent etre ouverts vers ce VPS).
+#
+# REMPLACER sync.EXEMPLE.COM par ton domaine : enregistrement DNS de type A
+# qui pointe vers l'IPv4 du VPS (attendre la propagation avant le 1er demarrage).
+#
+# Installation : sudo cp Caddyfile /etc/caddy/Caddyfile
+#                sudo systemctl reload caddy
+#
+# Le serveur python n'ecoute que sur 127.0.0.1:8799 (SYNC_HOST) : c'est Caddy
+# qui termine le TLS. L'auth Bearer est geree par l'app (SYNC_TOKEN), pas ici.
+
+sync.EXEMPLE.COM {
+	reverse_proxy 127.0.0.1:8799
+
+	# Journal d'acces (optionnel mais utile pour auditer qui pousse/tire)
+	log {
+		output file /var/log/caddy/antidetect-sync.log
+	}
+}
