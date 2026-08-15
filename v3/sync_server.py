@@ -118,6 +118,11 @@ def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db() as con:
         con.executescript(SCHEMA)
+        # Migration douce : colonne is_admin (1 = peut administrer le serveur).
+        try:
+            con.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass  # colonne déjà présente
 
 
 app = FastAPI(title="antidetect sync v3.1")
@@ -149,7 +154,7 @@ def resolve(cred: HTTPAuthorizationCredentials = Depends(_bearer)) -> Ctx:
     with db() as con:
         row = con.execute(
             "SELECT u.account_id, u.email, u.display_name, u.max_profiles,"
-            "       u.created_at, s.expires_at"
+            "       u.created_at, u.is_admin, s.expires_at"
             " FROM sessions s JOIN users u ON u.account_id = s.account_id"
             " WHERE s.token = ?", (tok,)).fetchone()
     if row is None:
@@ -166,6 +171,14 @@ def require_account(ctx: Ctx) -> Ctx:
     """Les routes comptes/equipes n'ont pas de sens avec le token legacy."""
     if ctx.legacy:
         raise HTTPException(403, "mode legacy (SYNC_TOKEN) : pas de compte")
+    return ctx
+
+
+def require_admin(ctx: Ctx) -> Ctx:
+    """Routes d'administration serveur : exige un compte marqué is_admin=1."""
+    require_account(ctx)
+    if not ctx.account["is_admin"]:
+        raise HTTPException(403, "réservé aux administrateurs du serveur")
     return ctx
 
 
@@ -334,8 +347,28 @@ def me(ctx: Ctx = Depends(resolve)):
     return {"account_id": ctx.account["account_id"],
             "email": ctx.account["email"],
             "display_name": ctx.account["display_name"],
+            "is_admin": bool(ctx.account["is_admin"]),
             "max_profiles": ctx.account["max_profiles"],
             "created_at": ctx.account["created_at"]}
+
+
+@app.get("/admin/users")
+def admin_users(ctx: Ctx = Depends(resolve)):
+    """Liste tous les comptes du serveur (réservé aux is_admin)."""
+    require_admin(ctx)
+    with db() as con:
+        users = [dict(r) for r in con.execute(
+            "SELECT account_id, email, display_name, is_admin, max_profiles, created_at "
+            "FROM users ORDER BY created_at")]
+        for u in users:
+            u["profiles"] = [r["name"] for r in con.execute(
+                "SELECT name FROM profiles WHERE owner_id=?", (u["account_id"],))]
+            u["teams"] = [dict(r) for r in con.execute(
+                "SELECT t.name, t.team_id, tm.role FROM team_members tm "
+                "JOIN teams t ON t.team_id = tm.team_id WHERE tm.user_id=?",
+                (u["account_id"],))]
+            del u["account_id"]  # pas d'id interne en sortie publique
+    return {"users": users}
 
 
 # ---------------------------------------------------------------- profils/blobs
