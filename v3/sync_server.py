@@ -331,7 +331,8 @@ def auth_salt(email: str):
 @app.get("/me")
 def me(ctx: Ctx = Depends(resolve)):
     require_account(ctx)
-    return {"email": ctx.account["email"],
+    return {"account_id": ctx.account["account_id"],
+            "email": ctx.account["email"],
             "display_name": ctx.account["display_name"],
             "max_profiles": ctx.account["max_profiles"],
             "created_at": ctx.account["created_at"]}
