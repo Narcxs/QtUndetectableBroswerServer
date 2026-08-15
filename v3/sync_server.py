@@ -123,6 +123,26 @@ def init_db():
             con.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass  # colonne déjà présente
+        # Migration douce : abonnement à durée (NULL = illimité).
+        try:
+            con.execute("ALTER TABLE users ADD COLUMN plan_expires_at TEXT")
+        except Exception:
+            pass
+        # Migration douce : teams = groupes de profils (remarque, règles JSON, builtin).
+        for ddl in ("ALTER TABLE teams ADD COLUMN remark TEXT",
+                    "ALTER TABLE teams ADD COLUMN rules TEXT",
+                    "ALTER TABLE teams ADD COLUMN builtin INTEGER NOT NULL DEFAULT 0"):
+            try:
+                con.execute(ddl)
+            except Exception:
+                pass
+        # Groupe natif « default » : les profils sans groupe y apparaissent.
+        con.execute(
+            "INSERT INTO teams (team_id, name, owner_id, max_members, created_at,"
+            " remark, builtin) SELECT 'default', 'Default', '', 999999, ?,"
+            " 'Groupe par défaut', 1 WHERE NOT EXISTS"
+            " (SELECT 1 FROM teams WHERE team_id = 'default')",
+            (_now().isoformat(),))
 
 
 app = FastAPI(title="antidetect sync v3.1")
@@ -154,7 +174,7 @@ def resolve(cred: HTTPAuthorizationCredentials = Depends(_bearer)) -> Ctx:
     with db() as con:
         row = con.execute(
             "SELECT u.account_id, u.email, u.display_name, u.max_profiles,"
-            "       u.created_at, u.is_admin, s.expires_at"
+            "       u.created_at, u.is_admin, u.plan_expires_at, s.expires_at"
             " FROM sessions s JOIN users u ON u.account_id = s.account_id"
             " WHERE s.token = ?", (tok,)).fetchone()
     if row is None:
@@ -310,11 +330,15 @@ def login(body: LoginIn):
     verifier = _b64(body.verifier_b64, "verifier_b64", 16, 128)
     digest = hashlib.sha256(verifier).hexdigest()
     with db() as con:
-        row = con.execute("SELECT account_id, verifier_sha256 FROM users"
-                          " WHERE email = ?", (email,)).fetchone()
+        row = con.execute("SELECT account_id, verifier_sha256, plan_expires_at"
+                          " FROM users WHERE email = ?", (email,)).fetchone()
     # message identique email inconnu / mauvais verifier (pas d'enumeration)
     if row is None or not hmac.compare_digest(row["verifier_sha256"], digest):
         raise HTTPException(401, "identifiants invalides")
+    # Abonnement expire : l'acces est bloque (message clair pour l'UI).
+    if row["plan_expires_at"] and datetime.fromisoformat(
+            row["plan_expires_at"]) < _now():
+        raise HTTPException(403, "abonnement expiré — contactez votre fournisseur")
     token = secrets.token_hex(32)
     exp = _now() + timedelta(days=SESSION_DAYS)
     with db() as con:
@@ -349,6 +373,7 @@ def me(ctx: Ctx = Depends(resolve)):
             "display_name": ctx.account["display_name"],
             "is_admin": bool(ctx.account["is_admin"]),
             "max_profiles": ctx.account["max_profiles"],
+            "plan_expires_at": ctx.account["plan_expires_at"],
             "created_at": ctx.account["created_at"]}
 
 
@@ -358,8 +383,8 @@ def admin_users(ctx: Ctx = Depends(resolve)):
     require_admin(ctx)
     with db() as con:
         users = [dict(r) for r in con.execute(
-            "SELECT account_id, email, display_name, is_admin, max_profiles, created_at "
-            "FROM users ORDER BY created_at")]
+            "SELECT account_id, email, display_name, is_admin, max_profiles,"
+            " plan_expires_at, created_at FROM users ORDER BY created_at")]
         for u in users:
             u["profiles"] = [r["name"] for r in con.execute(
                 "SELECT name FROM profiles WHERE owner_id=?", (u["account_id"],))]
@@ -739,11 +764,19 @@ class UserPatch(BaseModel):
     display_name: str | None = None
     max_profiles: int | None = None
     is_admin: bool | None = None
+    plan_expires_at: str | None = None  # ISO ; "" = illimité
+
+
+class ResetPasswordIn(BaseModel):
+    salt_b64: str
+    verifier_b64: str
 
 
 class TeamPatch(BaseModel):
     name: str | None = None
     max_members: int | None = None
+    remark: str | None = None
+    rules: str | None = None  # JSON des règles globales du groupe (appliquées client-side)
 
 
 class TeamCreate(BaseModel):
@@ -775,8 +808,34 @@ def admin_user_patch(email: str, body: UserPatch, ctx: Ctx = Depends(resolve)):
         if body.is_admin is not None:
             con.execute("UPDATE users SET is_admin = ? WHERE account_id = ?",
                         (1 if body.is_admin else 0, u["account_id"]))
+        if body.plan_expires_at is not None:
+            con.execute("UPDATE users SET plan_expires_at = ? WHERE account_id = ?",
+                        (body.plan_expires_at or None, u["account_id"]))
     print(f"[serveur] admin patch user {email} (par {ctx.account['email']})", flush=True)
     return {"updated": True, "email": email}
+
+
+@app.post("/admin/users/{email}/reset-password")
+def admin_reset_password(email: str, body: ResetPasswordIn,
+                         ctx: Ctx = Depends(resolve)):
+    """Réinitialise le mot de passe d'un compte (admin choisit le nouveau sel +
+    verifier calculés localement). ⚠️ La data_key de l'ancien mot de passe est
+    perdue : les données chiffrées propres au compte deviennent illisibles ;
+    les clés enveloppées (contenus partagés) doivent être re-enveloppées."""
+    require_admin(ctx)
+    salt = _b64(body.salt_b64, "salt_b64", 16, 16)
+    verifier = _b64(body.verifier_b64, "verifier_b64", 32, 128)
+    digest = hashlib.sha256(verifier).hexdigest()
+    with db() as con:
+        u = _user_by_email(con, email)
+        con.execute("UPDATE users SET salt_b64 = ?, verifier_sha256 = ?"
+                    " WHERE account_id = ?",
+                    (body.salt_b64, digest, u["account_id"]))
+        con.execute("DELETE FROM sessions WHERE account_id = ?",
+                    (u["account_id"],))  # force un nouveau login
+    print(f"[serveur] admin reset-password {email} (par {ctx.account['email']})",
+          flush=True)
+    return {"reset": True, "email": email}
 
 
 @app.delete("/admin/users/{email}")
@@ -801,12 +860,15 @@ def admin_user_delete(email: str, ctx: Ctx = Depends(resolve)):
 
 @app.get("/admin/teams")
 def admin_teams(ctx: Ctx = Depends(resolve)):
-    """Toutes les équipes du serveur avec leurs membres."""
+    """Tous les groupes de profils du serveur (avec membres + profils inclus).
+    Le groupe natif 'default' affiche aussi les profils sans groupe."""
     require_admin(ctx)
     with db() as con:
         teams = [dict(r) for r in con.execute(
-            "SELECT team_id, name, max_members, created_at FROM teams"
-            " ORDER BY created_at")]
+            "SELECT team_id, name, remark, rules, builtin, max_members, created_at"
+            " FROM teams ORDER BY builtin DESC, created_at")]
+        orphan = [r["name"] for r in con.execute(
+            "SELECT name FROM profiles WHERE team_id IS NULL")]
         for t in teams:
             t["members"] = [dict(r) for r in con.execute(
                 "SELECT u.email, tm.role FROM team_members tm"
@@ -814,6 +876,8 @@ def admin_teams(ctx: Ctx = Depends(resolve)):
                 " WHERE tm.team_id = ?", (t["team_id"],))]
             t["profiles"] = [r["name"] for r in con.execute(
                 "SELECT name FROM profiles WHERE team_id = ?", (t["team_id"],))]
+            if t["team_id"] == "default":
+                t["profiles"] = t["profiles"] + orphan
     return {"teams": teams}
 
 
@@ -850,6 +914,12 @@ def admin_team_patch(team_id: str, body: TeamPatch, ctx: Ctx = Depends(resolve))
                 raise HTTPException(400, "max_members invalide")
             con.execute("UPDATE teams SET max_members = ? WHERE team_id = ?",
                         (body.max_members, team_id))
+        if body.remark is not None:
+            con.execute("UPDATE teams SET remark = ? WHERE team_id = ?",
+                        (body.remark, team_id))
+        if body.rules is not None:
+            con.execute("UPDATE teams SET rules = ? WHERE team_id = ?",
+                        (body.rules, team_id))
     return {"updated": True}
 
 
