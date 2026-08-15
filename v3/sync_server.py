@@ -733,6 +733,225 @@ def get_key(name: str, ctx: Ctx = Depends(resolve)):
     return {"wrapped_key_b64": row["wrapped_key_b64"]}
 
 
+# ============================================================ ADMIN CRUD (v3.2)
+
+class UserPatch(BaseModel):
+    display_name: str | None = None
+    max_profiles: int | None = None
+    is_admin: bool | None = None
+
+
+class TeamPatch(BaseModel):
+    name: str | None = None
+    max_members: int | None = None
+
+
+class TeamCreate(BaseModel):
+    name: str
+    max_members: int = 5
+
+
+def _user_by_email(con, email: str):
+    row = con.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "compte inconnu")
+    return row
+
+
+@app.patch("/admin/users/{email}")
+def admin_user_patch(email: str, body: UserPatch, ctx: Ctx = Depends(resolve)):
+    """Modifie un compte (display_name, quota max_profiles, flag admin)."""
+    require_admin(ctx)
+    with db() as con:
+        u = _user_by_email(con, email)
+        if body.display_name is not None:
+            con.execute("UPDATE users SET display_name = ? WHERE account_id = ?",
+                        (body.display_name, u["account_id"]))
+        if body.max_profiles is not None:
+            if body.max_profiles < 0:
+                raise HTTPException(400, "max_profiles invalide")
+            con.execute("UPDATE users SET max_profiles = ? WHERE account_id = ?",
+                        (body.max_profiles, u["account_id"]))
+        if body.is_admin is not None:
+            con.execute("UPDATE users SET is_admin = ? WHERE account_id = ?",
+                        (1 if body.is_admin else 0, u["account_id"]))
+    print(f"[serveur] admin patch user {email} (par {ctx.account['email']})", flush=True)
+    return {"updated": True, "email": email}
+
+
+@app.delete("/admin/users/{email}")
+def admin_user_delete(email: str, ctx: Ctx = Depends(resolve)):
+    """Supprime un compte : sessions, memberships, clés, records profils.
+    Les blobs restent sur disque (nettoyage manuel du store possible)."""
+    require_admin(ctx)
+    with db() as con:
+        u = _user_by_email(con, email)
+        if u["account_id"] == ctx.account["account_id"]:
+            raise HTTPException(400, "impossible de se supprimer soi-même")
+        con.execute("DELETE FROM sessions WHERE account_id = ?", (u["account_id"],))
+        con.execute("DELETE FROM team_members WHERE user_id = ?", (u["account_id"],))
+        con.execute("DELETE FROM profile_keys WHERE user_id = ?", (u["account_id"],))
+        con.execute("UPDATE profiles SET team_id = NULL WHERE owner_id = ?",
+                    (u["account_id"],))
+        con.execute("DELETE FROM profiles WHERE owner_id = ?", (u["account_id"],))
+        con.execute("DELETE FROM users WHERE account_id = ?", (u["account_id"],))
+    print(f"[serveur] admin delete user {email} (par {ctx.account['email']})", flush=True)
+    return {"deleted": True, "note": "compte supprimé ; blobs conservés sur disque"}
+
+
+@app.get("/admin/teams")
+def admin_teams(ctx: Ctx = Depends(resolve)):
+    """Toutes les équipes du serveur avec leurs membres."""
+    require_admin(ctx)
+    with db() as con:
+        teams = [dict(r) for r in con.execute(
+            "SELECT team_id, name, max_members, created_at FROM teams"
+            " ORDER BY created_at")]
+        for t in teams:
+            t["members"] = [dict(r) for r in con.execute(
+                "SELECT u.email, tm.role FROM team_members tm"
+                " JOIN users u ON u.account_id = tm.user_id"
+                " WHERE tm.team_id = ?", (t["team_id"],))]
+            t["profiles"] = [r["name"] for r in con.execute(
+                "SELECT name FROM profiles WHERE team_id = ?", (t["team_id"],))]
+    return {"teams": teams}
+
+
+@app.post("/admin/teams", status_code=201)
+def admin_team_create(body: TeamCreate, ctx: Ctx = Depends(resolve)):
+    """Crée un groupe de profils (équipe) dont l'admin est owner."""
+    require_admin(ctx)
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "nom requis")
+    tid = secrets.token_hex(8)
+    with db() as con:
+        con.execute("INSERT INTO teams (team_id, name, owner_id, max_members,"
+                    " created_at) VALUES (?, ?, ?, ?, ?)",
+                    (tid, name, ctx.account["account_id"], body.max_members,
+                     _now().isoformat()))
+    print(f"[serveur] admin create team '{name}' ({tid})", flush=True)
+    return {"team_id": tid, "name": name}
+
+
+@app.patch("/admin/teams/{team_id}")
+def admin_team_patch(team_id: str, body: TeamPatch, ctx: Ctx = Depends(resolve)):
+    """Renomme une équipe / change son quota de sièges."""
+    require_admin(ctx)
+    with db() as con:
+        if con.execute("SELECT 1 FROM teams WHERE team_id = ?",
+                       (team_id,)).fetchone() is None:
+            raise HTTPException(404, "équipe inconnue")
+        if body.name is not None:
+            con.execute("UPDATE teams SET name = ? WHERE team_id = ?",
+                        (body.name.strip(), team_id))
+        if body.max_members is not None:
+            if body.max_members < 0:
+                raise HTTPException(400, "max_members invalide")
+            con.execute("UPDATE teams SET max_members = ? WHERE team_id = ?",
+                        (body.max_members, team_id))
+    return {"updated": True}
+
+
+@app.delete("/admin/teams/{team_id}")
+def admin_team_delete(team_id: str, ctx: Ctx = Depends(resolve)):
+    """Supprime une équipe : membres, liens profils (unshare), clés."""
+    require_admin(ctx)
+    with db() as con:
+        cur = con.execute("DELETE FROM teams WHERE team_id = ?", (team_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "équipe inconnue")
+        con.execute("DELETE FROM team_members WHERE team_id = ?", (team_id,))
+        con.execute("UPDATE profiles SET team_id = NULL WHERE team_id = ?",
+                    (team_id,))
+        con.execute("DELETE FROM profile_keys WHERE team_id = ?", (team_id,))
+    print(f"[serveur] admin delete team {team_id} (par {ctx.account['email']})",
+          flush=True)
+    return {"deleted": True}
+
+
+@app.post("/admin/teams/{team_id}/members", status_code=201)
+def admin_member_add(team_id: str, body: MemberIn, ctx: Ctx = Depends(resolve)):
+    """Ajoute un compte à une équipe (bypass owner — admin serveur)."""
+    require_admin(ctx)
+    if body.role not in ("admin", "member"):
+        raise HTTPException(400, "role invalide (admin|member)")
+    with db() as con:
+        t = con.execute("SELECT * FROM teams WHERE team_id = ?",
+                        (team_id,)).fetchone()
+        if t is None:
+            raise HTTPException(404, "équipe inconnue")
+        u = _user_by_email(con, body.email)
+        if u["account_id"] == t["owner_id"]:
+            raise HTTPException(400, "l'owner est déjà admin de son équipe")
+        if con.execute("SELECT 1 FROM team_members WHERE team_id = ?"
+                       " AND user_id = ?",
+                       (team_id, u["account_id"])).fetchone():
+            raise HTTPException(409, "déjà membre")
+        n = con.execute("SELECT COUNT(*) AS c FROM team_members tm"
+                        " JOIN teams t2 ON t2.team_id = tm.team_id"
+                        " WHERE tm.team_id = ? AND tm.user_id != t2.owner_id",
+                        (team_id,)).fetchone()["c"]
+        if n >= t["max_members"]:
+            raise HTTPException(403, f"quota de sièges atteint ({n}/{t['max_members']})")
+        con.execute("INSERT INTO team_members (team_id, user_id, role, added_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (team_id, u["account_id"], body.role, _now().isoformat()))
+    return {"added": True, "email": body.email, "role": body.role}
+
+
+@app.delete("/admin/teams/{team_id}/members/{email}")
+def admin_member_remove(team_id: str, email: str, ctx: Ctx = Depends(resolve)):
+    """Retire un compte d'une équipe (+ ses clés enveloppées de l'équipe)."""
+    require_admin(ctx)
+    with db() as con:
+        u = _user_by_email(con, email)
+        cur = con.execute("DELETE FROM team_members WHERE team_id = ?"
+                          " AND user_id = ?", (team_id, u["account_id"]))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "pas membre de cette équipe")
+        con.execute("DELETE FROM profile_keys WHERE team_id = ? AND user_id = ?",
+                    (team_id, u["account_id"]))
+    return {"removed": True, "email": email}
+
+
+@app.post("/admin/profiles/{name}/assign")
+def admin_profile_assign(name: str, body: ShareIn, ctx: Ctx = Depends(resolve)):
+    """Attribue un profil (n'importe quel owner) à une équipe — admin serveur."""
+    require_admin(ctx)
+    _check_name(name)
+    with db() as con:
+        if con.execute("SELECT 1 FROM teams WHERE team_id = ?",
+                       (body.team_id,)).fetchone() is None:
+            raise HTTPException(404, "équipe inconnue")
+        rec = con.execute("SELECT owner_id FROM profiles WHERE name = ?"
+                          " ORDER BY (owner_id = ?) DESC LIMIT 1",
+                          (name, ctx.account["account_id"])).fetchone()
+        if rec is None:
+            con.execute("INSERT INTO profiles (name, owner_id, team_id, created_at)"
+                        " VALUES (?, ?, ?, ?)",
+                        (name, ctx.account["account_id"], body.team_id,
+                         _now().isoformat()))
+        else:
+            con.execute("UPDATE profiles SET team_id = ? WHERE owner_id = ?"
+                        " AND name = ?", (body.team_id, rec["owner_id"], name))
+    print(f"[serveur] admin assign {name} -> team {body.team_id}", flush=True)
+    return {"assigned": True, "profile": name, "team_id": body.team_id}
+
+
+@app.post("/admin/profiles/{name}/unassign")
+def admin_profile_unassign(name: str, body: ShareIn, ctx: Ctx = Depends(resolve)):
+    """Retire un profil d'une équipe."""
+    require_admin(ctx)
+    _check_name(name)
+    with db() as con:
+        cur = con.execute("UPDATE profiles SET team_id = NULL WHERE name = ?"
+                          " AND team_id = ?", (name, body.team_id))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "profil non attribué à cette équipe")
+    return {"assigned": False, "profile": name}
+
+
 init_db()  # schema cree a l'import (couvre aussi `uvicorn sync_server:app`)
 
 if __name__ == "__main__":
